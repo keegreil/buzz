@@ -1,0 +1,134 @@
+name: Build Ubuntu 22.04 Buzz AppImage
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-x64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+      SOURCE_SHA: f3de860574bb3119018b4592353e9761635aeb07
+      VERSION: 0.5.8
+    steps:
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils \
+            build-essential \
+            ca-certificates \
+            curl \
+            desktop-file-utils \
+            file \
+            git \
+            libasound2-dev \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            pkg-config \
+            squashfs-tools \
+            wget \
+            xdg-utils
+
+      - name: Check out immutable Buzz release source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: block/buzz
+          ref: f3de860574bb3119018b4592353e9761635aeb07
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify source identity and ABI baseline
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.35"
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Install pinned AppImage tooling
+        run: |
+          wget -q -O /tmp/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  /tmp/appimagetool" | sha256sum -c
+          sudo install -m 0755 /tmp/appimagetool /usr/local/bin/appimagetool
+
+          wget -q -O /tmp/appimage-runtime \
+            https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+          echo "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  /tmp/appimage-runtime" | sha256sum -c
+          sudo install -D -m 0644 /tmp/appimage-runtime /usr/local/lib/appimage-runtime
+          echo "APPIMAGETOOL_RUNTIME_FILE=/usr/local/lib/appimage-runtime" >> "$GITHUB_ENV"
+
+      - name: Install desktop dependencies
+        run: just desktop-install-ci
+
+      - name: Build sidecars
+        run: |
+          cargo build --release \
+            -p buzz-acp \
+            -p buzz-agent \
+            -p buzz-backend-kubernetes \
+            -p buzz-dev-mcp \
+            -p git-credential-nostr \
+            -p buzz-cli
+          ./scripts/bundle-sidecars.sh
+
+      - name: Build and repair AppImage
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: |
+          cd desktop
+          pnpm tauri build --verbose --ci --bundles appimage --features mesh-llm
+          cd ..
+          appimage="$(find desktop/src-tauri/target/release/bundle/appimage -type f -name '*.AppImage' -print -quit)"
+          test -n "$appimage"
+          bash desktop/scripts/fix-appimage.sh "$appimage"
+
+      - name: Enforce Ubuntu 22.04 GLIBC ceiling
+        run: |
+          appimage="$(find desktop/src-tauri/target/release/bundle/appimage -type f -name '*.AppImage' -print -quit)"
+          mkdir abi-scan
+          cd abi-scan
+          "$GITHUB_WORKSPACE/$appimage" --appimage-extract >/dev/null
+          find squashfs-root -type f -print0 | while IFS= read -r -d '' candidate; do
+            if file -b "$candidate" | grep -q '^ELF'; then
+              readelf --version-info "$candidate" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' || true
+            fi
+          done | sort -Vu > glibc-requirements.txt
+          max_glibc="$(tail -n 1 glibc-requirements.txt)"
+          test -n "$max_glibc"
+          echo "Maximum required version: $max_glibc"
+          if dpkg --compare-versions "${max_glibc#GLIBC_}" gt 2.35; then
+            echo "Artifact requires $max_glibc, newer than Ubuntu 22.04's GLIBC_2.35" >&2
+            exit 1
+          fi
+
+      - name: Stage artifact and checksum
+        run: |
+          install -d dist
+          appimage="$(find desktop/src-tauri/target/release/bundle/appimage -type f -name '*.AppImage' -print -quit)"
+          install -m 0755 "$appimage" "dist/Buzz_${VERSION}_ubuntu22_amd64.AppImage"
+          cp abi-scan/glibc-requirements.txt dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+
+      - name: Upload Ubuntu 22.04 artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: Buzz-0.5.8-Ubuntu-22.04-x64
+          if-no-files-found: error
+          retention-days: 30
+          path: dist/
